@@ -1,0 +1,273 @@
+# 1.Hypothesis
+
+Null hypothesis: The noise complaint has not spatial clustered pattern.
+
+Alternative hypothesis: The noise complaint has spatial clustered pattern.
+
+Set our significance level : 0.05
+
+
+# 2.Read in data
+
+
+## Download data into local data file.
+
+```{r warning=FALSE, message=FALSE}
+#first Library some packages
+library(tidyverse)
+library(tmap)
+library(rgdal)
+library(broom)
+library(mapview)
+library(crosstalk)
+library(sf)
+library(sp)
+library(spdep)
+library(car)
+library(fs)
+library(janitor)
+library(here)
+library(readr)
+library(readxl)
+```
+
+## Read in
+
+```{r}
+#Read in and transform it to the correct projected CRS
+nyc_noise <- st_read(here::here('noisedata.geojson'))%>%
+  st_transform(., crs=32618)
+
+
+```
+
+# 3.Wrangling data
+
+## Joining data together
+
+```{r}
+#joining data together and count the noise point
+
+library(sf)
+points_sf_joined <-janitor::clean_names(nyc_noise)%>%
+  #calculate area
+  mutate(area=st_area(.))%>%
+  #then density of the points per area
+  mutate(density=unique_key/area)%>%
+  #select density and some other variables 
+  dplyr::select(density, ntacode, unique_key)
+
+```
+
+
+## Map the density of joined data
+
+We map to see the spatial distribution of joined data. From the map, it looks as though we might have some clustering. Next we will check this with Moran's I and some other statistics
+
+```{r}
+tm_shape(points_sf_joined) +
+    tm_polygons("density",
+        style="jenks",
+        palette="PuOr",
+        midpoint=NA,
+        popup.vars=c("ntacode", "density"),
+        title="noise complaints Density")+
+  tm_scale_bar(position=c(0.62,0.02),text.size=0.6)+
+  tm_compass(north=0,position=c(0.73,0.1))
+```
+
+# 5.Preparing data for analysis
+
+## Define a spatial weights matrix
+
+In the first instance we must create a neighbours list --- which is a list of all the neighbors.
+
+```{r}
+#create a neighbors list
+NY_nb <- points_sf_joined %>%
+  poly2nb(., queen=T)
+
+#get some summary infomation
+summary(NY_nb)
+```
+
+We can see that the average number of neighbors is 5.59
+
+```{r}
+#create a spatial weights matrix with the style of row standarzised
+NY_Matrix <- NY_nb %>%
+  nb2mat(., style="W")
+sum(NY_Matrix)
+```
+
+We have do a raw standardized where 1 is divided by the sum of the number of neighbors in each row. Therefore, in this case, row 1 here sums to 195, meaning each weight would be 0.0051 in row 1 only.
+
+Next we plot to see the neighborhoods.
+
+```{r}
+library(spdep)
+#First calculate the centroids of New York
+coordsNY <- points_sf_joined%>%
+  st_centroid()%>%
+  st_geometry()
+#plot the neighbourhoods with a map underneath
+plot(NY_nb, st_geometry(coordsNY), col="blue")
+plot(points_sf_joined$geometry, add=T)
+```
+
+# 6.Analysis
+
+## Moran I analysis
+
+Moran's I requires a spatial weight list type object.
+
+Moran's I falls between -1 and 1. And the results could be interpreted as follow: 1 = clustered, 0 = no pattern, -1 = dispersed.
+
+```{r}
+#create a spatial weight list
+NY_LIST <- NY_nb %>%
+  nb2listw(., style="W")
+
+#calculate for the densities
+I_NY_Raw_Density <- points_sf_joined %>%
+  pull(density) %>%
+  as.vector()%>%
+  moran.test(., NY_LIST)
+
+I_NY_Raw_Density
+```
+
+From the results, The Moran's I statistic = 0.51, which shows that we have some distinctive clustering.
+
+## Geary's C Analysis 
+
+Geary's C Analysis is used to see whether similar values or dissimilar values are clustering.
+
+Geary's C falls between 0 and 2, and the results could be interpreted as follow: 1 means no spatial autocorrelation, \<1 - positive spatial autocorrelation or similar values clustering, \>1 - negative spatial autocorreation or dissimilar values clustering.
+
+```{r}
+C_NY_Raw_Density <- points_sf_joined %>%
+  pull(density) %>%
+  as.vector()%>%
+  geary.test(., NY_LIST)
+
+C_NY_Raw_Density
+```
+
+From the results, The Geary's C statistic = 0.47 which shows that similar values are clustering.
+
+## Getis Ord analysis 
+
+General G is used to see whether high or low values are clustering.
+
+If G \> Expected = High values clustering; if G \< expected = low values clustering
+
+```{r}
+G_NY_Raw_Density <- 
+  points_sf_joined %>%
+  pull(density) %>%
+  as.vector()%>%
+  globalG.test(., NY_LIST)
+
+G_NY_Raw_Density
+```
+
+From the results, it shows G \> Expected, therefore meaning that High values are tending to cluster.
+
+## local versions of the Moran's I statistic
+
+Calculate to Moran's I statistic to see where we have hot-spots.
+
+```{r}
+#calculate local versions
+I_NY_Local_count <- points_sf_joined %>%
+  pull(unique_key) %>%
+  as.vector()%>%
+  localmoran(., NY_LIST)%>%
+  as_tibble()
+
+I_NY_Local_Density <- points_sf_joined %>%
+  pull(density) %>%
+  as.vector()%>%
+  localmoran(., NY_LIST)%>%
+  as_tibble()
+
+#look the output
+slice_head(I_NY_Local_Density, n=5)
+```
+
+Copy some columns back into our New York Data frame
+
+```{r}
+#Mutate some column
+points_sf_joined1 <- points_sf_joined %>%
+  mutate(point_count_I = as.numeric(I_NY_Local_count$Ii))%>%
+  mutate(point_count_Iz =as.numeric(I_NY_Local_count$Z.Ii))%>%
+  mutate(density_I =as.numeric(I_NY_Local_Density$Ii))%>%
+  mutate(density_Iz =as.numeric(I_NY_Local_Density$Z.Ii))
+```
+
+## local versions of the Getis Ord statistic
+
+Calculate to Getis Ord statistic to see where we have hot-spots.
+
+```{r}
+#calculate local versions
+Gi_NY_Local_Density <- points_sf_joined %>%
+  pull(density) %>%
+  as.vector()%>%
+  localG(., NY_LIST)
+
+#look the output
+head(Gi_NY_Local_Density)
+```
+
+Copy some columns back into our New York Data frame
+
+```{r}
+#Mutate some column
+points_sf_joined <- points_sf_joined %>%
+  mutate(density_G = as.numeric(Gi_NY_Local_Density))
+```
+
+# 7.Outputs
+
+### Mapping outputs of local Moran's I analysis
+
+```{r}
+#set the break mannually based on standard deviations and significant level
+breaks1<-c(-1000,-2.58,-1.96,-1.65,1.65,1.96,2.58,1000)
+```
+
+Plot on an interactive map
+
+```{r}
+#plot
+tm_shape(points_sf_joined1) +
+    tm_polygons("density_I",
+        style="fixed",
+        breaks=breaks1,
+        palette="PuOr",
+        midpoint=NA,
+        title="Local Moran's I, Noise Complaints in New York")+
+  tm_scale_bar(position=c(0.62,0.02),text.size=0.6)+
+  tm_compass(north=0,position=c(0.73,0.1))
+```
+
+we can see that ...... are standout as hot-spots.
+
+### Mapping outputs of local Getis Ord analysis
+
+```{r}
+tm_shape(points_sf_joined) +
+    tm_polygons("density_G",
+        style="fixed",
+        breaks=breaks1,
+        palette="PuOr",
+        midpoint=NA,
+        title="local Getis Ord, Noise Complaints in New York")+
+  tm_scale_bar(position=c(0.62,0.02),text.size=0.6)+
+  tm_compass(north=0,position=c(0.73,0.1))
+```
+
+we can see that ...... are standout as hot-spots.
